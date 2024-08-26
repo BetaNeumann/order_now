@@ -1,15 +1,36 @@
-__version__ = 'v1'
+from .models import (
+    engine,
+    url,
+    model_mapping,
+    Base,
+    Extra,
+    Flavor,
+    Group,
+    Item,
+    LoginAttempt,
+    Order,
+    OrderItem,
+    OrderItemExtra,
+    User,
+)
 
-import asyncio
-from sqlalchemy.schema import CreateSchema
+from .connect import get_session
+from .. import enums
 
-from . import models, schemas
-from models import engine, session
-
-
-async def startup():
-    async with engine.connect() as conn:
-        conn.execute(CreateSchema(__version__, if_not_exists=True))
-
-
-asyncio.run(startup())
+__all__ = [
+    'get_session',
+    'engine',
+    'url',
+    'model_mapping',
+    'Base',
+    'Extra',
+    'Flavor',
+    'Group',
+    'Item',
+    'LoginAttempt',
+    'Order',
+    'OrderItem',
+    'OrderItemExtra',
+    'User',
+    'enums'
+]

@@ -1,96 +1,62 @@
-from typing import TYPE_CHECKING, Self
-from types import new_class
+from typing import Callable, Any
 from decimal import Decimal
 from datetime import datetime
 from ipaddress import IPv4Address
-from dataclasses import field
 
-from sqlalchemy import MetaData
-from sqlalchemy import BigInteger, Numeric
-from sqlalchemy import select, func
-from sqlalchemy.orm import DeclarativeBase, MappedAsDataclass, Mapped
+from sqlmodel import SQLModel, Field, Relationship
+from sqlmodel import select, func
+
+from sqlalchemy import BigInteger
 from sqlalchemy.orm import declared_attr
-from sqlalchemy.schema import Identity
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.dialects.postgresql import INET
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
-from .columns import column, relationship, standard_fk
-from . import enums
+from .. import enums
 from .. import funcs
-
-from . import __version__
-
-if TYPE_CHECKING:
-    from . import schemas
 
 
 hasher = PasswordHasher()
 
-type_annotation_map = {
-    Decimal: Numeric(12,2),
-    IPv4Address: INET
-}
+# Commonly used fields
+decimal_field = Field(default=0, max_digits=10, decimal_places=2, ge=0)
 
 
-class Base(DeclarativeBase, MappedAsDataclass):
-    metadata = MetaData(schema=__version__)
-    type_annotation_map = type_annotation_map
-
-    __schema__: type['schemas.Schema[Self]'] | None = field(init=False, repr=False, default=None)
-
-    id: Mapped[int] = column(BigInteger, Identity(), primary_key=True, sort_order=-99, init=False)
+class Base(SQLModel):
+    id: int = Field(primary_key=True, sa_type=BigInteger)
 
 
     @declared_attr.directive
-    def __tablename__(cls) -> str:
+    def __tablename__(cls) -> str | Callable[..., str]: # type: ignore
         return funcs.snake_case(cls.__name__)
 
 
-    @classmethod
-    def schema(cls, *, only: tuple[str, ...] | None = None, exclude: tuple[str, ...] = ()) -> 'schemas.Schema[Self]':
-        if cls.__schema__ is None:
-            from .schemas import Schema
-            
-            class Meta(Schema.Meta):
-                model = cls
-            
-            cls.__schema__ = new_class(f'{cls.__name__}Schema', (Schema,), {'Meta': Meta})
+class User(Base, table=True):
+    name: str
+    email: str
+    password: str = Field(exclude=True, repr=False)
+    access_level: enums.UserAccessLevel = Field(default=enums.UserAccessLevel.employee)
+    blocked: bool = Field(default=False)
 
-        return cls.__schema__(only=only, exclude=exclude)
+    login_attempts: list['LoginAttempt'] = Relationship(back_populates='user')
+    orders: list['Order'] = Relationship(back_populates='user')
 
 
-class User(Base):
-    name: Mapped[str] = column()
-    email: Mapped[str] = column()
-    _password: Mapped[str] = column('password')
-    access_level: Mapped[enums.UserAccessLevel] = column()
-    blocked: Mapped[bool] = column(default=False)
-
-    login_attempts: Mapped[list['LoginAttempt']] = relationship(back_populates='user', default_factory=list)
-    orders: Mapped[list['Order']] = relationship(back_populates='user', default_factory=list)
-
-
-    @property
-    def password(self) -> str:
-        return self._password
+    def model_post_init(self, __context: Any):
+        if not self.password.startswith('$argon2'):
+            self.password = hasher.hash(self.password)
 
 
     @property
     def login_attempts_count(self) -> int:
         return funcs.get_session(self).execute(
-            select(func.count(LoginAttempt.id)).where(
+            select(func.count('*')).where(
                 LoginAttempt.user_id == User.id,
                 LoginAttempt.date >= datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             )
         ).scalar_one()
-
-
-    def set_new_password(self, new_password: str) -> None:
-        self._password = hasher.hash(new_password)
 
 
     def validate_password(self, password: str) -> bool:
@@ -105,102 +71,106 @@ class User(Base):
             return False
 
         if hasher.check_needs_rehash(self.password):
-            self.set_new_password(password)
+            self.password = hasher.hash(password)
 
         return True
 
 
-class LoginAttempt(Base):
-    date: Mapped[datetime] = column(default=datetime.now())
-    ip: Mapped[IPv4Address] = column()
+class LoginAttempt(Base, table=True):
+    date: datetime = Field(default=datetime.now())
+    ip: IPv4Address
 
-    user_id: Mapped[int] = standard_fk('user')
-    user: Mapped[User] = relationship(back_populates='login_attempts')
-
-
-class Group(Base):
-    description: Mapped[str] = column()
-    
-    items: Mapped[list['Item']] = relationship('group', default_factory=list, lazy='immediate')
+    user_id: int = Field(foreign_key='user.id', sa_type=BigInteger)
+    user: User = Relationship(back_populates='login_attempts')
 
 
-class Item(Base):
-    name: Mapped[str] = column()
-    description: Mapped[str] = column()
-    price: Mapped[Decimal] = column()
+class Group(Base, table=True):
+    description: str
 
-    group_id: Mapped[int] = standard_fk('group')
-    group: Mapped[Group] = relationship(back_populates='items')
-
-    flavors: Mapped[list['Flavor']] = relationship(back_populates='item', default_factory=list)
-    extras: Mapped[list['Extra']] = relationship(back_populates='item', default_factory=list)
-    ordered_items: Mapped[list['OrderItem']] = relationship(back_populates='item', default_factory=list)
+    items: list['Item'] = Relationship(back_populates='group', cascade_delete=True)
 
 
-class Flavor(Base):
-    description: Mapped[str] = column()
-    price: Mapped[Decimal] = column(default=Decimal(0))
-    
-    item_id: Mapped[int] = standard_fk('item')
-    item: Mapped[Item] = relationship(back_populates='flavors')
+class Item(Base, table=True):
+    name: str
+    description: str
+    price: Decimal = decimal_field
+
+    group_id: int | None = Field(foreign_key='group.id', default=None, sa_type=BigInteger)
+    group: Group | None = Relationship(back_populates='items')
+
+    flavors: list['Flavor'] = Relationship(back_populates='item', cascade_delete=True)
+    extras: list['Extra'] = Relationship(back_populates='item', cascade_delete=True)
+    ordered_items: list['OrderItem'] = Relationship(back_populates='item')
 
 
-class Extra(Base):
-    description: Mapped[str] = column()
-    price: Mapped[Decimal] = column()
+class Flavor(Base, table=True):
+    description: str
+    price: Decimal = decimal_field
 
-    item_id: Mapped[int] = standard_fk('item')
-    item: Mapped[Item] = relationship(back_populates='extras')
-
-
-class Order(Base):
-    created_at: Mapped[datetime] = column(default=datetime.now())
-    client_name: Mapped[str | None] = column()
-    table_number: Mapped[int | None] = column()
-    total: Mapped[Decimal] = column()
-
-    user_id: Mapped[int] = standard_fk('user')
-    user: Mapped[User] = relationship(back_populates='orders')
-
-    ordered_items: Mapped[list['OrderItem']] = relationship(back_populates='order', default_factory=list)
+    item_id: int = Field(foreign_key='item.id', sa_type=BigInteger)
+    item: Item = Relationship(back_populates='flavors')
 
 
-class OrderItem(Base):
-    ammount: Mapped[int] = column()
+class Extra(Base, table=True):
+    description: str
+    price: Decimal = decimal_field
 
-    order_id: Mapped[int] = standard_fk('order')
-    order: Mapped[Order] = relationship(back_populates='ordered_items')
-
-    item_id: Mapped[int] = standard_fk('item')
-    item: Mapped[Item] = relationship(back_populates='ordered_items', lazy='dynamic')
-    
-    flavor_id: Mapped[int | None] = standard_fk('flavor', nullable=True)
-    flavor: Mapped[Flavor | None] = relationship(back_populates='ordered_items')
-
-    extras: Mapped[list['OrderItemExtra']] = relationship(back_populates='order_item', default_factory=list)
+    item_id: int = Field(foreign_key='item.id', sa_type=BigInteger)
+    item: Item = Relationship(back_populates='extras')
 
 
-class OrderItemExtra(Base):
-    ammount: Mapped[int] = column()
+class Order(Base, table=True):
+    created_at: datetime = Field(default=datetime.now())
+    closed_at: datetime | None = Field(default=None)
+    client_name: str | None = Field(default=None)
+    table_number: int | None = Field(default=None)
+    total: Decimal = decimal_field
 
-    order_item_id: Mapped[int] = standard_fk('order_item')
-    order_item: Mapped[OrderItem] = relationship(back_populates='extras')
+    user_id: int = Field(foreign_key='user.id', sa_type=BigInteger)
+    user: User = Relationship(back_populates='orders')
 
-    extra_id: Mapped[int] = standard_fk('extra')
-    extra: Mapped[Extra] = relationship(lazy='immediate')
+    ordered_items: list['OrderItem'] = Relationship(
+        back_populates='order', cascade_delete=True, sa_relationship_kwargs=dict(lazy='selectin')
+    )
+
+
+class OrderItem(Base, table=True):
+    ammount: int
+    status: enums.OrderItemStatus = Field(default=enums.OrderItemStatus.preparing)
+
+    order_id: int = Field(foreign_key='order.id', sa_type=BigInteger)
+    order: Order = Relationship(back_populates='ordered_items')
+
+    item_id: int = Field(foreign_key='item.id', sa_type=BigInteger)
+    item: Item = Relationship(back_populates='ordered_items', sa_relationship_kwargs=dict(lazy='selectin'))
+
+    flavor_id: int | None = Field(foreign_key='flavor.id', default=None, sa_type=BigInteger)
+    flavor: Flavor | None = Relationship()
+
+    extras: list['OrderItemExtra'] = Relationship(
+        back_populates='order_item', cascade_delete=True, sa_relationship_kwargs=dict(lazy='selectin')
+    )
+
+
+class OrderItemExtra(Base, table=True):
+    ammount: int
+
+    order_item_id: int = Field(foreign_key='order_item.id', sa_type=BigInteger)
+    order_item: OrderItem = Relationship(back_populates='extras')
+
+    extra_id: int = Field(foreign_key='extra.id', sa_type=BigInteger)
+    extra: Extra = Relationship(sa_relationship_kwargs=dict(lazy='selectin'))
 
 
 # Engine declaration
-engine = create_async_engine(
-    URL.create(
-        drivername='postgresql+psycopg',
-        username='order_now',
-        password=funcs.get_envar('ORDER_NOW_PASSWORD'),
-        host='localhost',
-        port=5432,
-        database='service_now'
-    ),
-    echo=True
+url = URL.create(
+    drivername='postgresql+psycopg',
+    username='order_now',
+    password=funcs.get_envar('ORDER_NOW_PASSWORD'),
+    host='localhost',
+    port=5432,
+    database='order_now_v1'
 )
 
-session = AsyncSession(engine)
+engine = create_async_engine(url)
+model_mapping = {mapper.class_.__tablename__: mapper.class_ for mapper in Base._sa_registry.mappers}
